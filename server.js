@@ -1,46 +1,20 @@
 /**
- * server.js
+ * TRACE — Metadata Backend
  * -------------------------------------------------------------------------
- * Photo + Video Metadata Backend
+ * Supports:
+ *   • Image metadata
+ *   • EXIF
+ *   • GPS
+ *   • IPTC
+ *   • XMP
+ *   • Camera information
+ *   • Date/time
+ *   • Video metadata
+ *   • Audio metadata
+ *   • MediaInfo
+ *   • Remote URL metadata
  *
- * EXIFTOOL API
- *   → EXIF
- *   → IPTC
- *   → XMP
- *   → GPS
- *   → Camera information
- *   → Date/time
- *   → Image/file metadata
- *
- * MEDIAINFO
- *   → Video codec
- *   → Audio codec
- *   → Resolution
- *   → FPS
- *   → Bitrate
- *   → Duration
- *   → Audio channels
- *
- * Supported input:
- *   1. File upload
- *   2. Remote URL
- *
- * -------------------------------------------------------------------------
- *
- * Install:
- *
- *   npm init -y
- *   npm install express multer cors dotenv
- *
- * MediaInfo CLI is also required for deep video/audio metadata.
- *
- * -------------------------------------------------------------------------
- *
- * .env
- *
- *   EXIFTOOL_API_KEY=YOUR_API_KEY_HERE
- *   PORT=4000
- *
+ * Node.js 18+
  * -------------------------------------------------------------------------
  */
 
@@ -58,15 +32,11 @@ const util = require('util');
 
 const execFileAsync = util.promisify(execFile);
 
-// Node.js 18+ has built-in fetch.
-// If you're using Node.js <18, install node-fetch@2.
-const fetch = global.fetch;
-
 const app = express();
 
-/* -------------------------------------------------------------------------
+/* =========================================================================
    CONFIG
-------------------------------------------------------------------------- */
+   ========================================================================= */
 
 const PORT = process.env.PORT || 4000;
 
@@ -78,14 +48,14 @@ const EXIFTOOL_API_KEY =
 
 if (!EXIFTOOL_API_KEY) {
   console.error(
-    'ERROR: EXIFTOOL_API_KEY is missing from your .env file.'
+    'ERROR: EXIFTOOL_API_KEY is missing.'
   );
   process.exit(1);
 }
 
-/* -------------------------------------------------------------------------
+/* =========================================================================
    MIDDLEWARE
-------------------------------------------------------------------------- */
+   ========================================================================= */
 
 app.use(cors());
 
@@ -95,9 +65,9 @@ app.use(
   })
 );
 
-/* -------------------------------------------------------------------------
+/* =========================================================================
    MULTER
-------------------------------------------------------------------------- */
+   ========================================================================= */
 
 const upload = multer({
   dest: os.tmpdir(),
@@ -107,33 +77,57 @@ const upload = multer({
   }
 });
 
-/* -------------------------------------------------------------------------
+/* =========================================================================
    HEALTH CHECK
-------------------------------------------------------------------------- */
+   ========================================================================= */
 
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
-    service: 'Photo & Video Metadata API'
+    service: 'TRACE Metadata API',
+    version: '2.0.0',
+    exiftool: Boolean(EXIFTOOL_API_KEY)
   });
 });
 
 /* =========================================================================
-   EXIFTOOL API
+   EXIFTOOLS API
    ========================================================================= */
 
 /**
- * Send a local file to ExifTools.com API
+ * Send a local file to ExifTools.com.
  *
- * API:
- * POST https://exiftools.com/api/v1/extract
+ * IMPORTANT:
+ * ExifTools API expects:
  *
- * Authentication:
- * X-API-Key
+ * multipart/form-data
+ * field = "file"
+ *
+ * NOT:
+ *
+ * application/octet-stream
  */
-async function extractExifToolMetadata(filePath) {
+async function extractExifToolMetadata(filePath, originalName, mimeType) {
 
   const fileBuffer = await fs.readFile(filePath);
+
+  /*
+   * Node.js 18+ provides FormData and Blob globally.
+   */
+  const form = new FormData();
+
+  const blob = new Blob(
+    [fileBuffer],
+    {
+      type: mimeType || 'application/octet-stream'
+    }
+  );
+
+  form.append(
+    'file',
+    blob,
+    originalName || 'uploaded-file'
+  );
 
   const response = await fetch(
     EXIFTOOL_API_URL,
@@ -141,13 +135,10 @@ async function extractExifToolMetadata(filePath) {
       method: 'POST',
 
       headers: {
-        'X-API-Key': EXIFTOOL_API_KEY,
-
-        'Content-Type':
-          'application/octet-stream'
+        'X-API-Key': EXIFTOOL_API_KEY
       },
 
-      body: fileBuffer
+      body: form
     }
   );
 
@@ -159,15 +150,27 @@ async function extractExifToolMetadata(filePath) {
     data = JSON.parse(responseText);
   } catch {
     throw new Error(
-      `ExifTools returned invalid JSON: ${responseText}`
+      `ExifTools returned invalid JSON (${response.status}): ${responseText.slice(0, 1000)}`
     );
   }
 
   if (!response.ok) {
 
+    const apiError =
+      data?.error ||
+      data?.message ||
+      responseText;
+
     throw new Error(
-      `ExifTools API error ${response.status}: ${
-        data.error || responseText
+      `ExifTools API error ${response.status}: ${formatError(apiError)}`
+    );
+  }
+
+  if (data?.success === false) {
+
+    throw new Error(
+      `ExifTools extraction failed: ${
+        formatError(data.error || data.message || data)
       }`
     );
   }
@@ -179,23 +182,24 @@ async function extractExifToolMetadata(filePath) {
    MEDIAINFO
    ========================================================================= */
 
-/**
- * Extract deep video/audio metadata using MediaInfo CLI.
- *
- * This is separate from ExifTools API because MediaInfo provides
- * detailed stream/codec information.
- */
 async function extractMediaInfo(filePath) {
 
   try {
 
-    const { stdout } = await execFileAsync(
-      'mediainfo',
-      [
-        '--Output=JSON',
-        filePath
-      ]
-    );
+    const { stdout } =
+      await execFileAsync(
+        'mediainfo',
+        [
+          '--Output=JSON',
+          filePath
+        ]
+      );
+
+    if (!stdout) {
+      throw new Error(
+        'MediaInfo returned an empty response.'
+      );
+    }
 
     return JSON.parse(stdout);
 
@@ -208,20 +212,64 @@ async function extractMediaInfo(filePath) {
 }
 
 /* =========================================================================
+   ERROR FORMATTER
+   ========================================================================= */
+
+function formatError(error) {
+
+  if (error == null) {
+    return 'Unknown error';
+  }
+
+  if (typeof error === 'string') {
+    return error;
+  }
+
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
+}
+
+/* =========================================================================
+   FILE TYPE HELPERS
+   ========================================================================= */
+
+function isImage(mimeType) {
+  return String(mimeType || '')
+    .toLowerCase()
+    .startsWith('image/');
+}
+
+function isVideo(mimeType) {
+  return String(mimeType || '')
+    .toLowerCase()
+    .startsWith('video/');
+}
+
+function isAudio(mimeType) {
+  return String(mimeType || '')
+    .toLowerCase()
+    .startsWith('audio/');
+}
+
+/* =========================================================================
    FILE METADATA ENDPOINT
    ========================================================================= */
 
 /**
  * POST /api/metadata
  *
- * File upload:
- *
- * Content-Type:
  * multipart/form-data
- *
- * Field:
- * file
+ * field:
+ *   file
  */
+
 app.post(
   '/api/metadata',
   upload.single('file'),
@@ -233,29 +281,32 @@ app.post(
     try {
 
       /* ---------------------------------------------------------------
-         Check uploaded file
-      ---------------------------------------------------------------- */
+         Check upload
+         --------------------------------------------------------------- */
 
       if (!req.file) {
 
         return res.status(400).json({
           success: false,
-          error:
-            'No file uploaded. Use multipart field "file".'
+          error: 'No file uploaded. Use multipart field "file".'
         });
       }
 
       tempPath = req.file.path;
 
       const originalName =
-        req.file.originalname;
+        req.file.originalname || 'uploaded-file';
 
       const mimeType =
-        req.file.mimetype || 'application/octet-stream';
+        req.file.mimetype ||
+        'application/octet-stream';
+
+      const fileSize =
+        req.file.size || 0;
 
       /* ---------------------------------------------------------------
-         Initial response
-      ---------------------------------------------------------------- */
+         Result object
+         --------------------------------------------------------------- */
 
       const result = {
 
@@ -264,7 +315,7 @@ app.post(
         file: {
           filename: originalName,
           mimeType: mimeType,
-          size: req.file.size
+          size: fileSize
         },
 
         exiftool: null,
@@ -275,31 +326,38 @@ app.post(
       };
 
       /* ===============================================================
-         1. EXIFTOOL API
-      =============================================================== */
+         EXIFTOOLS
+         =============================================================== */
 
       try {
 
         result.exiftool =
           await extractExifToolMetadata(
-            tempPath
+            tempPath,
+            originalName,
+            mimeType
           );
 
       } catch (error) {
 
+        console.error(
+          'ExifTools error:',
+          error
+        );
+
         result.errors.push({
           service: 'exiftool',
-          message: error.message
+          message: formatError(error)
         });
       }
 
       /* ===============================================================
-         2. MEDIAINFO
-      =============================================================== */
+         MEDIAINFO
+         =============================================================== */
 
       if (
-        mimeType.startsWith('video/') ||
-        mimeType.startsWith('audio/')
+        isVideo(mimeType) ||
+        isAudio(mimeType)
       ) {
 
         try {
@@ -311,33 +369,41 @@ app.post(
 
         } catch (error) {
 
+          console.error(
+            'MediaInfo error:',
+            error
+          );
+
           result.errors.push({
             service: 'mediainfo',
-            message: error.message
+            message: formatError(error)
           });
         }
       }
 
       /* ---------------------------------------------------------------
-         Send response
-      ---------------------------------------------------------------- */
+         Final response
+         --------------------------------------------------------------- */
 
       res.json(result);
 
     } catch (error) {
 
-      console.error(error);
+      console.error(
+        'Metadata endpoint error:',
+        error
+      );
 
       res.status(500).json({
         success: false,
-        error: error.message
+        error: formatError(error)
       });
 
     } finally {
 
       /* ---------------------------------------------------------------
-         Delete temporary file
-      ---------------------------------------------------------------- */
+         Remove temporary file
+         --------------------------------------------------------------- */
 
       if (tempPath) {
 
@@ -356,15 +422,13 @@ app.post(
 /**
  * POST /api/metadata-url
  *
- * JSON:
+ * Body:
  *
  * {
- *   "url": "https://example.com/photo.jpg"
+ *   "url": "https://example.com/image.jpg"
  * }
- *
- * The server downloads the file temporarily and sends it to
- * ExifTools.com.
  */
+
 app.post(
   '/api/metadata-url',
 
@@ -374,7 +438,12 @@ app.post(
 
     try {
 
-      const { url } = req.body;
+      const { url } =
+        req.body || {};
+
+      /* ---------------------------------------------------------------
+         Check URL
+         --------------------------------------------------------------- */
 
       if (!url) {
 
@@ -385,14 +454,15 @@ app.post(
       }
 
       /* ---------------------------------------------------------------
-         Basic URL validation
-      ---------------------------------------------------------------- */
+         Validate URL
+         --------------------------------------------------------------- */
 
       let parsedUrl;
 
       try {
 
-        parsedUrl = new URL(url);
+        parsedUrl =
+          new URL(url);
 
       } catch {
 
@@ -416,14 +486,15 @@ app.post(
 
       /* ---------------------------------------------------------------
          Download remote file
-      ---------------------------------------------------------------- */
+         --------------------------------------------------------------- */
 
-      const response = await fetch(
-        url,
-        {
-          redirect: 'follow'
-        }
-      );
+      const response =
+        await fetch(
+          url,
+          {
+            redirect: 'follow'
+          }
+        );
 
       if (!response.ok) {
 
@@ -435,7 +506,8 @@ app.post(
       const mimeType =
         response.headers.get(
           'content-type'
-        ) || 'application/octet-stream';
+        ) ||
+        'application/octet-stream';
 
       const buffer =
         Buffer.from(
@@ -444,12 +516,13 @@ app.post(
 
       /* ---------------------------------------------------------------
          Create temporary file
-      ---------------------------------------------------------------- */
+         --------------------------------------------------------------- */
 
-      tempPath = path.join(
-        os.tmpdir(),
-        crypto.randomUUID()
-      );
+      tempPath =
+        path.join(
+          os.tmpdir(),
+          crypto.randomUUID()
+        );
 
       await fs.writeFile(
         tempPath,
@@ -457,8 +530,24 @@ app.post(
       );
 
       /* ---------------------------------------------------------------
+         Filename
+         --------------------------------------------------------------- */
+
+      let originalName =
+        path.basename(
+          parsedUrl.pathname
+        );
+
+      if (
+        !originalName ||
+        originalName === '/'
+      ) {
+        originalName = 'remote-file';
+      }
+
+      /* ---------------------------------------------------------------
          Result
-      ---------------------------------------------------------------- */
+         --------------------------------------------------------------- */
 
       const result = {
 
@@ -478,31 +567,38 @@ app.post(
       };
 
       /* ===============================================================
-         EXIFTOOL API
-      =============================================================== */
+         EXIFTOOLS
+         =============================================================== */
 
       try {
 
         result.exiftool =
           await extractExifToolMetadata(
-            tempPath
+            tempPath,
+            originalName,
+            mimeType
           );
 
       } catch (error) {
 
+        console.error(
+          'ExifTools URL error:',
+          error
+        );
+
         result.errors.push({
           service: 'exiftool',
-          message: error.message
+          message: formatError(error)
         });
       }
 
       /* ===============================================================
          MEDIAINFO
-      =============================================================== */
+         =============================================================== */
 
       if (
-        mimeType.startsWith('video/') ||
-        mimeType.startsWith('audio/')
+        isVideo(mimeType) ||
+        isAudio(mimeType)
       ) {
 
         try {
@@ -514,22 +610,34 @@ app.post(
 
         } catch (error) {
 
+          console.error(
+            'MediaInfo URL error:',
+            error
+          );
+
           result.errors.push({
             service: 'mediainfo',
-            message: error.message
+            message: formatError(error)
           });
         }
       }
+
+      /* ---------------------------------------------------------------
+         Send result
+         --------------------------------------------------------------- */
 
       res.json(result);
 
     } catch (error) {
 
-      console.error(error);
+      console.error(
+        'URL metadata error:',
+        error
+      );
 
       res.status(500).json({
         success: false,
-        error: error.message
+        error: formatError(error)
       });
 
     } finally {
@@ -541,6 +649,45 @@ app.post(
           .catch(() => {});
       }
     }
+  }
+);
+
+/* =========================================================================
+   404
+   ========================================================================= */
+
+app.use(
+  (req, res) => {
+
+    res.status(404).json({
+      success: false,
+      error: 'Endpoint not found.'
+    });
+
+  }
+);
+
+/* =========================================================================
+   GLOBAL ERROR HANDLER
+   ========================================================================= */
+
+app.use(
+  (error, req, res, next) => {
+
+    console.error(
+      'Unhandled error:',
+      error
+    );
+
+    if (res.headersSent) {
+      return next(error);
+    }
+
+    res.status(500).json({
+      success: false,
+      error: formatError(error)
+    });
+
   }
 );
 
@@ -557,9 +704,11 @@ app.listen(
     console.log(
       '=============================================='
     );
+
     console.log(
-      ' Metadata Backend Started'
+      ' TRACE Metadata Backend Started'
     );
+
     console.log(
       '=============================================='
     );
@@ -581,12 +730,13 @@ app.listen(
     );
 
     console.log(
-      'ExifTools API: Connected'
+      'ExifTools API: configured'
     );
 
     console.log(
       '=============================================='
     );
+
     console.log('');
   }
 );
